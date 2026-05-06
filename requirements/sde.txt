@@ -1,0 +1,7 @@
+numpy
+pandas
+torch
+tqdm
+transformers
+pyterrier
+

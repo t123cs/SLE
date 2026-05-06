@@ -1,0 +1,21 @@
+# Core LRD dependencies. Use lrd.freeze.txt if you need the original
+# environment snapshot for closer reproduction.
+accelerate
+beir
+bitsandbytes
+datasets
+numpy
+pandas
+peft
+pytrec-eval
+PyYAML
+requests
+safetensors
+scikit-learn
+scipy
+sentence-transformers
+spacy
+torch
+tqdm
+transformers
+ujson

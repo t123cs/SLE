@@ -1,0 +1,8 @@
+# Core benchmark dependencies. The full Doc2Query++ path additionally needs
+# bertopic, keybert, umap-learn, hdbscan, and a local embedding model.
+numpy
+pandas
+requests
+tqdm
+transformers
+pyterrier

@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Environments and local config
+.venv/
+venv/
+env/
+.env
+*.env.local
+
+# Data, models, and generated artifacts
+data/
+datasets/
+models/
+checkpoints/
+adapters/
+cache/
+artifacts/
+results/
+outputs/
+runs/
+logs/
+tmp/
+*.log
+
+# Large model/index artifacts
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.faiss
+*.index
+*.idx
+*.gz
+*.zip
+*.tar
+*.tar.gz
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
