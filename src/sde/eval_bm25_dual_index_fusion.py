@@ -14,7 +14,9 @@ import json
 import math
 import re
 import shutil
+import zipfile
 from collections import Counter, defaultdict
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +42,9 @@ STOPWORDS = {
 
 DEFAULT_BLACKLISTED_MODEL_IDS = {220, 128009}
 BAD_DECODED_TERMS = {"s", "t", "re", "ve", "ll", "d", "m"}
+TERRIER_JAR = Path("/root/autodl-tmp/SLE/cache/pyterrier/terrier-assemblies-5.11-jar-with-dependencies.jar")
+WORD_RE = re.compile(r"[A-Za-z0-9]")
+LIST_MARKER_RE = re.compile(r"(?m)^\s*(?:[-*]|\d+[.)])\s+")
 
 
 def parse_token_id_blacklist(arg):
@@ -196,6 +201,272 @@ def sanitize_query_for_pyterrier(text):
     return " ".join(re.findall(r"[A-Za-z0-9]+", str(text)))
 
 
+def clean_generated_query(text):
+    text = (text or "").strip().strip("\"'")
+    text = LIST_MARKER_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def load_terrier_stopwords(jar_path=TERRIER_JAR):
+    with zipfile.ZipFile(jar_path) as jar:
+        with jar.open("stopword-list.txt") as fin:
+            return {
+                line.decode("utf-8").strip()
+                for line in fin
+                if line.decode("utf-8").strip() and not line.decode("utf-8").startswith("#")
+            }
+
+
+def terrier_terms(terrier_tokeniser, porter_stemmer, stopwords, text, min_len=1):
+    terms = []
+    for token in terrier_tokeniser.getTokens(text or ""):
+        token = str(token)
+        if token in stopwords:
+            continue
+        stemmed = str(porter_stemmer.stem(token))
+        if stemmed and len(stemmed) >= min_len and stemmed not in stopwords:
+            terms.append(stemmed)
+    return terms
+
+
+def add_terms(dst, terms):
+    dst.update(terms)
+
+
+def add_counter(dst, src):
+    for term, freq in src.items():
+        if freq > 0:
+            dst[term] += int(freq)
+
+
+def candidate_frequency(value, mode, scale):
+    if value <= 0:
+        return 0
+    if mode == "event_count":
+        return max(1, int(round(value)))
+    if mode == "doc_binary":
+        return 1
+    if mode == "sqrt":
+        return max(1, int(math.ceil(math.sqrt(value))))
+    if mode == "log":
+        return max(1, int(math.ceil(math.log2(value + 1.0))))
+    if mode == "scaled":
+        return max(1, int(round(value * scale)))
+    raise ValueError(f"Unknown candidate frequency mode: {mode}")
+
+
+def decode_piece(tokenizer, token_id):
+    return tokenizer.decode([int(token_id)], clean_up_tokenization_spaces=False)
+
+
+def is_wordish(text):
+    return bool(WORD_RE.search(text or ""))
+
+
+def is_punctuation_piece(piece):
+    stripped = piece.strip()
+    return bool(stripped) and not is_wordish(stripped)
+
+
+def starts_new_span(piece, current_pieces):
+    if not current_pieces:
+        return True
+    if piece.startswith((" ", "\n", "\t")):
+        return True
+    if is_punctuation_piece(piece):
+        return True
+    if is_punctuation_piece(current_pieces[-1]):
+        return True
+    return False
+
+
+def selected_top1_ids(row):
+    return [int(ids[0]) for ids in row.get("indices", []) if ids]
+
+
+def build_span_mask(
+    row,
+    tokenizer,
+    terrier_tokeniser,
+    porter_stemmer,
+    stopwords,
+    min_len,
+    allow_multitoken_start_alternatives,
+):
+    """Return zero-based generation positions where candidate alternatives are safe."""
+
+    safe_positions = set()
+    stats = Counter()
+    cur_positions = []
+    cur_pieces = []
+
+    def flush():
+        nonlocal cur_positions, cur_pieces
+        if not cur_positions:
+            return
+        text = "".join(cur_pieces).strip()
+        terms = terrier_terms(terrier_tokeniser, porter_stemmer, stopwords, text, min_len=min_len)
+        if terms:
+            stats["spans_with_terms"] += 1
+            if len(cur_positions) == 1:
+                safe_positions.add(cur_positions[0])
+                stats["single_token_spans_kept"] += 1
+            else:
+                stats["multi_token_spans_masked"] += 1
+                stats["positions_masked_in_multi_token_spans"] += len(cur_positions)
+                if allow_multitoken_start_alternatives:
+                    safe_positions.add(cur_positions[0])
+                    stats["multi_token_starts_kept"] += 1
+        cur_positions = []
+        cur_pieces = []
+
+    for pos, token_id in enumerate(selected_top1_ids(row)):
+        piece = decode_piece(tokenizer, token_id)
+        if starts_new_span(piece, cur_pieces):
+            flush()
+        cur_positions.append(pos)
+        cur_pieces.append(piece)
+    flush()
+    return safe_positions, stats
+
+
+def make_token_terms(tokenizer, terrier_tokeniser, porter_stemmer, stopwords, min_len):
+    @lru_cache(maxsize=200000)
+    def transform(token_id):
+        piece = decode_piece(tokenizer, int(token_id))
+        return tuple(terrier_terms(terrier_tokeniser, porter_stemmer, stopwords, piece, min_len=min_len))
+
+    return transform
+
+
+def load_doc2query_term_counts(
+    synthesis_path,
+    terrier_tokeniser,
+    porter_stemmer,
+    stopwords,
+    max_queries_per_doc,
+):
+    expansions = defaultdict(Counter)
+    per_doc_rows = Counter()
+    stats = Counter()
+    with open(synthesis_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            doc_id = str(row.get("doc_id", row.get("pos_id", ""))).strip()
+            if not doc_id:
+                continue
+            if max_queries_per_doc > 0 and per_doc_rows[doc_id] >= max_queries_per_doc:
+                continue
+            query_text = clean_generated_query(row.get("query_text", ""))
+            if not query_text:
+                continue
+            terms = terrier_terms(terrier_tokeniser, porter_stemmer, stopwords, query_text, min_len=1)
+            if not terms:
+                continue
+            expansions[doc_id].update(terms)
+            per_doc_rows[doc_id] += 1
+            stats["doc2query_rows"] += 1
+            stats["doc2query_terms"] += len(terms)
+    stats["doc2query_docs"] = len(expansions)
+    return dict(expansions), dict(stats)
+
+
+def load_boundary_mask_candidate_counts(
+    synthesis_path,
+    tokenizer,
+    token_terms,
+    terrier_tokeniser,
+    porter_stemmer,
+    stopwords,
+    candidate_topk,
+    candidate_min_prob,
+    candidate_min_len,
+    candidate_min_df,
+    candidate_max_df_ratio,
+    candidate_frequency_mode,
+    candidate_frequency_scale,
+    include_top1_candidate,
+    allow_multitoken_start_alternatives,
+    num_docs,
+):
+    raw = defaultdict(Counter)
+    stats = Counter()
+    start_rank = 1 if include_top1_candidate else 2
+    with open(synthesis_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            doc_id = str(row.get("doc_id", row.get("pos_id", ""))).strip()
+            if not doc_id:
+                continue
+            stats["rows"] += 1
+            safe_positions, mask_stats = build_span_mask(
+                row,
+                tokenizer,
+                terrier_tokeniser,
+                porter_stemmer,
+                stopwords,
+                min_len=candidate_min_len,
+                allow_multitoken_start_alternatives=allow_multitoken_start_alternatives,
+            )
+            stats.update(mask_stats)
+            stats["safe_positions"] += len(safe_positions)
+            for pos, (ids, probs) in enumerate(zip(row.get("indices", []), row.get("probs", []))):
+                if pos not in safe_positions or not ids or not probs:
+                    continue
+                for rank, (token_id, prob_raw) in enumerate(zip(ids, probs), start=1):
+                    if rank < start_rank or rank > candidate_topk:
+                        continue
+                    prob = float(prob_raw)
+                    if prob < candidate_min_prob:
+                        continue
+                    terms = token_terms(int(token_id))
+                    if not terms:
+                        continue
+                    for term in terms:
+                        raw[doc_id][term] += 1.0
+                    stats["candidate_events"] += 1
+                    stats["candidate_event_terms"] += len(terms)
+
+    df = Counter()
+    for weights in raw.values():
+        for term, value in weights.items():
+            if value > 0:
+                df[term] += 1
+    max_df = max(1, int(candidate_max_df_ratio * num_docs)) if candidate_max_df_ratio > 0 else num_docs
+    keep = {term for term, term_df in df.items() if term_df >= candidate_min_df and term_df <= max_df}
+
+    materialized = {}
+    for doc_id, weights in raw.items():
+        counts = Counter()
+        for term, value in weights.items():
+            if term not in keep:
+                continue
+            freq = candidate_frequency(value, candidate_frequency_mode, candidate_frequency_scale)
+            if freq > 0:
+                counts[term] += freq
+        if counts:
+            materialized[doc_id] = counts
+
+    stats["candidate_docs_raw"] = len(raw)
+    stats["candidate_docs_materialized"] = len(materialized)
+    stats["candidate_vocab_filtered"] = len(keep)
+    stats["candidate_tokens_materialized"] = sum(sum(counts.values()) for counts in materialized.values())
+    stats["candidate_topk"] = candidate_topk
+    stats["candidate_min_prob"] = candidate_min_prob
+    stats["candidate_min_len"] = candidate_min_len
+    stats["candidate_min_df"] = candidate_min_df
+    stats["candidate_max_df_ratio"] = candidate_max_df_ratio
+    stats["candidate_frequency_mode"] = candidate_frequency_mode
+    stats["candidate_frequency_scale"] = candidate_frequency_scale
+    stats["include_top1_candidate"] = include_top1_candidate
+    stats["allow_multitoken_start_alternatives"] = allow_multitoken_start_alternatives
+    return materialized, dict(stats)
+
+
 def load_corpus(path):
     doc_ids = []
     doc_texts = []
@@ -227,7 +498,7 @@ def load_queries(path):
 def load_qrels(path):
     qrels = defaultdict(dict)
     with open(path, "r", encoding="utf-8") as handle:
-        first = True
+        header = None
         for line in handle:
             line = line.strip()
             if not line:
@@ -235,13 +506,25 @@ def load_qrels(path):
             parts = line.split("\t")
             if len(parts) < 3:
                 continue
-            if first and parts[0].lower() in {"qid", "query_id"}:
-                first = False
+            if header is None and parts[0].lower() in {"qid", "query_id", "query-id"}:
+                header = [part.lower() for part in parts]
                 continue
-            first = False
-            qid = parts[0]
-            did = parts[2]
-            rel = int(parts[3]) if len(parts) >= 4 else 1
+            if header and {"query-id", "corpus-id", "score"}.issubset(set(header)):
+                qid = parts[header.index("query-id")]
+                did = parts[header.index("corpus-id")]
+                rel = int(parts[header.index("score")])
+            elif header and {"qid", "docno", "label"}.issubset(set(header)):
+                qid = parts[header.index("qid")]
+                did = parts[header.index("docno")]
+                rel = int(parts[header.index("label")])
+            elif len(parts) >= 4:
+                qid = parts[0]
+                did = parts[2]
+                rel = int(parts[3])
+            else:
+                qid = parts[0]
+                did = parts[1]
+                rel = int(parts[2])
             qrels[qid][did] = rel
     return dict(qrels)
 
@@ -271,7 +554,7 @@ def ensure_pyterrier():
 def maybe_load_indexref(index_dir):
     data_properties = Path(index_dir) / "data.properties"
     if data_properties.exists():
-        return pt.IndexRef.of(str(data_properties))
+        return pt.IndexRef.of(str(data_properties.resolve()))
     return None
 
 
@@ -281,10 +564,78 @@ def index_corpus(index_dir, doc_ids, doc_texts, reuse_existing):
         print(f"Reusing existing index at {index_dir}")
         return existing
 
+    index_dir = str(Path(index_dir).resolve())
     Path(index_dir).mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame({"docno": doc_ids, "text": doc_texts})
     indexer = pt.DFIndexer(index_dir, overwrite=True)
     return indexer.index(frame["text"], frame["docno"])
+
+
+def iter_pretokenized_enhanced_corpus(
+    doc_ids,
+    doc_texts,
+    terrier_tokeniser,
+    porter_stemmer,
+    stopwords,
+    doc2query_counts,
+    candidate_counts,
+):
+    for doc_id, doc_text in zip(doc_ids, doc_texts):
+        counts = Counter()
+        add_terms(counts, terrier_terms(terrier_tokeniser, porter_stemmer, stopwords, doc_text, min_len=1))
+        add_counter(counts, doc2query_counts.get(doc_id, Counter()))
+        add_counter(counts, candidate_counts.get(doc_id, Counter()))
+        yield {"docno": doc_id, "toks": dict(counts)}
+
+
+def index_pretokenized_enhanced_corpus(
+    index_dir,
+    doc_ids,
+    doc_texts,
+    terrier_tokeniser,
+    porter_stemmer,
+    stopwords,
+    doc2query_counts,
+    candidate_counts,
+    reuse_existing,
+):
+    existing = maybe_load_indexref(index_dir) if reuse_existing else None
+    if existing is not None:
+        print(f"Reusing existing index at {index_dir}")
+        return existing
+
+    index_dir = str(Path(index_dir).resolve())
+    Path(index_dir).mkdir(parents=True, exist_ok=True)
+    indexer = pt.IterDictIndexer(
+        str(index_dir),
+        meta={"docno": 32},
+        meta_reverse=["docno"],
+        pretokenised=True,
+        threads=1,
+    )
+    return indexer.index(
+        iter_pretokenized_enhanced_corpus(
+            doc_ids,
+            doc_texts,
+            terrier_tokeniser,
+            porter_stemmer,
+            stopwords,
+            doc2query_counts,
+            candidate_counts,
+        )
+    )
+
+
+def prepare_pretokenized_query_df(queries, qrels, terrier_tokeniser, porter_stemmer, stopwords):
+    rows = []
+    for qid in qrels.keys():
+        if qid not in queries:
+            continue
+        query = queries[qid]
+        qterms = Counter(terrier_terms(terrier_tokeniser, porter_stemmer, stopwords, query, min_len=1))
+        if qterms:
+            rows.append({"qid": qid, "query": query, "query_toks": dict(qterms)})
+    return pd.DataFrame(rows)
 
 
 def read_index_stats(index_dir):
@@ -726,6 +1077,24 @@ def main():
     parser.add_argument("--generated_query_score_bonus", type=float, default=1.0)
     parser.add_argument("--recovery_fragment_min_len", type=int, default=2)
     parser.add_argument("--keep_recovered_fragments", action="store_true")
+    parser.add_argument("--doc2query_max_queries_per_doc", type=int, default=-1)
+    parser.add_argument("--candidate_topk", type=int, default=10)
+    parser.add_argument("--candidate_min_prob", type=float, default=0.01)
+    parser.add_argument("--candidate_min_len", type=int, default=3)
+    parser.add_argument("--candidate_min_df", type=int, default=2)
+    parser.add_argument("--candidate_max_df_ratio", type=float, default=0.35)
+    parser.add_argument(
+        "--candidate_frequency",
+        default="doc_binary",
+        choices=["event_count", "doc_binary", "sqrt", "log", "scaled"],
+    )
+    parser.add_argument("--candidate_frequency_scale", type=float, default=10.0)
+    parser.add_argument("--include_top1_candidate", action="store_true")
+    parser.add_argument(
+        "--disable_allow_multitoken_start_alternatives",
+        action="store_true",
+        help="Disable the current best allow-start Boundary Mask behavior.",
+    )
     parser.add_argument(
         "--exclude_generated_query_terms",
         action="store_true",
@@ -746,33 +1115,70 @@ def main():
     qrels = load_qrels(args.qrels_tsv)
     query_df = prepare_query_df(queries, qrels)
 
-    doc_to_expansion_text, expansion_doc_stats = build_document_expansion_texts(
-        expansion_jsonl=args.expansion_jsonl,
-        model_path=args.model_path,
-        sample_idx_max=args.sample_idx_max,
-        generated_query_term_mode=args.generated_query_term_mode,
-        generated_query_min_count=args.generated_query_min_count,
-        generated_query_min_soft_support=args.generated_query_min_soft_support,
-        generated_query_min_soft_coverage=args.generated_query_min_soft_coverage,
-        generated_query_score_bonus=args.generated_query_score_bonus,
-        recovery_fragment_min_len=args.recovery_fragment_min_len,
-        suppress_recovered_fragments=not args.keep_recovered_fragments,
-        per_step_topk=args.per_step_topk,
-        prob_threshold=args.prob_threshold,
-        max_soft_terms_per_doc=args.max_soft_terms_per_doc,
-        term_weight_mode=args.term_weight_mode,
-        repeat_score_scale=args.repeat_score_scale,
-        repeat_max_times=args.repeat_max_times,
-        blacklisted_model_ids=blacklisted_model_ids,
+    terrier_tokeniser = pt.terrier.TerrierTokeniser.java_tokeniser(
+        pt.terrier.TerrierTokeniser._to_obj("english")
     )
-
-    expansion_doc_ids = []
-    expansion_doc_texts = []
-    for doc_id in doc_ids:
-        expansion_text = doc_to_expansion_text.get(doc_id)
-        if expansion_text:
-            expansion_doc_ids.append(doc_id)
-            expansion_doc_texts.append(expansion_text)
+    porter_stemmer = pt.terrier.TerrierStemmer.porter
+    stopwords = load_terrier_stopwords()
+    route_b_query_df = prepare_pretokenized_query_df(
+        queries,
+        qrels,
+        terrier_tokeniser,
+        porter_stemmer,
+        stopwords,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    token_terms = make_token_terms(
+        tokenizer,
+        terrier_tokeniser,
+        porter_stemmer,
+        stopwords,
+        args.candidate_min_len,
+    )
+    doc2query_counts, doc2query_stats = load_doc2query_term_counts(
+        args.expansion_jsonl,
+        terrier_tokeniser,
+        porter_stemmer,
+        stopwords,
+        max_queries_per_doc=args.doc2query_max_queries_per_doc,
+    )
+    candidate_counts, candidate_stats = load_boundary_mask_candidate_counts(
+        args.expansion_jsonl,
+        tokenizer,
+        token_terms,
+        terrier_tokeniser,
+        porter_stemmer,
+        stopwords,
+        candidate_topk=args.candidate_topk,
+        candidate_min_prob=args.candidate_min_prob,
+        candidate_min_len=args.candidate_min_len,
+        candidate_min_df=args.candidate_min_df,
+        candidate_max_df_ratio=args.candidate_max_df_ratio,
+        candidate_frequency_mode=args.candidate_frequency,
+        candidate_frequency_scale=args.candidate_frequency_scale,
+        include_top1_candidate=args.include_top1_candidate,
+        allow_multitoken_start_alternatives=not args.disable_allow_multitoken_start_alternatives,
+        num_docs=len(doc_ids),
+    )
+    expansion_doc_stats = {
+        "route_b": "original_plus_doc2query_plus_allow_start_boundary_mask_candidates",
+        "doc2query": doc2query_stats,
+        "candidate": candidate_stats,
+        "doc2query_max_queries_per_doc": args.doc2query_max_queries_per_doc,
+        "candidate_topk": args.candidate_topk,
+        "candidate_min_prob": args.candidate_min_prob,
+        "candidate_min_len": args.candidate_min_len,
+        "candidate_min_df": args.candidate_min_df,
+        "candidate_max_df_ratio": args.candidate_max_df_ratio,
+        "candidate_frequency": args.candidate_frequency,
+        "candidate_frequency_scale": args.candidate_frequency_scale,
+        "include_top1_candidate": args.include_top1_candidate,
+        "allow_multitoken_start_alternatives": not args.disable_allow_multitoken_start_alternatives,
+    }
 
     doc_index_dir = args.doc_index_dir or str(out_dir / "doc_index")
     expansion_index_dir = args.expansion_index_dir or str(out_dir / "expansion_index")
@@ -785,32 +1191,27 @@ def main():
     )
     doc_index_stats = read_index_stats(doc_index_dir)
 
-    expansion_index_stats = {
-        "index_dir": str(expansion_index_dir),
-        "num_documents": 0,
-        "num_terms": 0,
-        "num_pointers": 0,
-        "size_bytes": 0,
-    }
-    if expansion_doc_ids:
-        expansion_index_ref = index_corpus(
-            expansion_index_dir,
-            expansion_doc_ids,
-            expansion_doc_texts,
-            reuse_existing=args.reuse_expansion_index,
-        )
-        expansion_index_stats = read_index_stats(expansion_index_dir)
-        expansion_retriever = build_retriever(
-            expansion_index_ref,
-            args.expansion_retrieval_topn,
-            args.expansion_k1,
-            args.expansion_b,
-        )
-        expansion_results = expansion_retriever.transform(query_df)[
-            ["qid", "docno", "score", "rank"]
-        ].copy()
-    else:
-        expansion_results = pd.DataFrame(columns=["qid", "docno", "score", "rank"])
+    expansion_index_ref = index_pretokenized_enhanced_corpus(
+        expansion_index_dir,
+        doc_ids,
+        doc_texts,
+        terrier_tokeniser,
+        porter_stemmer,
+        stopwords,
+        doc2query_counts,
+        candidate_counts,
+        reuse_existing=args.reuse_expansion_index,
+    )
+    expansion_index_stats = read_index_stats(expansion_index_dir)
+    expansion_retriever = build_retriever(
+        expansion_index_ref,
+        args.expansion_retrieval_topn,
+        args.expansion_k1,
+        args.expansion_b,
+    )
+    expansion_results = expansion_retriever.transform(route_b_query_df)[
+        ["qid", "docno", "score", "rank"]
+    ].copy()
 
     doc_retriever = build_retriever(
         doc_index_ref,
@@ -843,7 +1244,7 @@ def main():
 
     result_payload = {
         "n_docs": len(doc_ids),
-        "n_expansion_docs": len(expansion_doc_ids),
+        "n_expansion_docs": len(doc_ids),
         "n_eval_queries": int(query_df.shape[0]),
         "doc_index_dir": doc_index_dir,
         "expansion_index_dir": expansion_index_dir,
@@ -875,6 +1276,17 @@ def main():
             "repeat_score_scale": args.repeat_score_scale,
             "repeat_max_times": args.repeat_max_times,
             "model_token_id_blacklist": sorted(blacklisted_model_ids),
+            "route_b": "doc2query_plus_allow_start_boundary_mask_candidates",
+            "doc2query_max_queries_per_doc": args.doc2query_max_queries_per_doc,
+            "candidate_topk": args.candidate_topk,
+            "candidate_min_prob": args.candidate_min_prob,
+            "candidate_min_len": args.candidate_min_len,
+            "candidate_min_df": args.candidate_min_df,
+            "candidate_max_df_ratio": args.candidate_max_df_ratio,
+            "candidate_frequency": args.candidate_frequency,
+            "candidate_frequency_scale": args.candidate_frequency_scale,
+            "include_top1_candidate": args.include_top1_candidate,
+            "allow_multitoken_start_alternatives": not args.disable_allow_multitoken_start_alternatives,
         },
         "best_result": metrics,
         "best_run": str(run_path),
@@ -893,7 +1305,7 @@ def main():
     print("[SDE Dual-Index Summary]")
     print(
         f"eval_queries={int(query_df.shape[0])} "
-        f"expansion_docs={len(expansion_doc_ids)} "
+        f"expansion_docs={len(doc_ids)} "
         f"score_normalization={args.score_normalization} "
         f"fusion_alpha={args.fusion_alpha:.2f}"
     )
@@ -905,7 +1317,10 @@ def main():
         f"per_step_topk={args.per_step_topk} prob_threshold={args.prob_threshold:.4f} "
         f"max_soft_terms_per_doc={args.max_soft_terms_per_doc} "
         f"term_weight_mode={args.term_weight_mode} "
-        f"generated_query_term_mode={args.generated_query_term_mode}"
+        f"route_b=doc2query+allow-start-boundary-mask "
+        f"candidate_topk={args.candidate_topk} "
+        f"candidate_min_prob={args.candidate_min_prob:.4f} "
+        f"candidate_frequency={args.candidate_frequency}"
     )
     print(
         f"ndcg@10={metrics['ndcg_at_10']:.6f} "
