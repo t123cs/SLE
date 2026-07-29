@@ -1,0 +1,60 @@
+{
+  "method": "SDE, single index",
+  "selection_protocol": {
+    "metric": "train delta_nDCG@10 - 0.5 * bootstrap_SE",
+    "test_tuning": false,
+    "transfer": {
+      "scidocs": "fiqa-2018",
+      "arguana": "nfcorpus"
+    }
+  },
+  "trace": {
+    "templates": 6,
+    "samples_per_template": 1,
+    "sample_idx_max": 0,
+    "candidate_topk": 5,
+    "event_min_probability": 0.001,
+    "candidate_min_length": 2,
+    "boundary_min_length": 3
+  },
+  "retrieval": {
+    "min_aggregate_probability": 0.01,
+    "candidate_max_df_ratio": 0.05,
+    "k1": 0.9,
+    "b": 0.4,
+    "retrieval_topn": 1000
+  },
+  "datasets": {
+    "nfcorpus": {
+      "selection_source": "nfcorpus train",
+      "position_mode": "all",
+      "max_soft_terms": 16,
+      "exclude_original_terms": false
+    },
+    "scidocs": {
+      "selection_source": "fiqa-2018 train (transferred)",
+      "position_mode": "all",
+      "max_soft_terms": 16,
+      "exclude_original_terms": false
+    },
+    "fiqa-2018": {
+      "selection_source": "fiqa-2018 train",
+      "position_mode": "all",
+      "max_soft_terms": 16,
+      "exclude_original_terms": false
+    },
+    "arguana": {
+      "selection_source": "nfcorpus train (transferred)",
+      "position_mode": "all",
+      "max_soft_terms": 16,
+      "exclude_original_terms": false
+    },
+    "scifact": {
+      "selection_source": "scifact train",
+      "position_mode": "boundary",
+      "max_soft_terms": 4,
+      "exclude_original_terms": true
+    }
+  }
+}
+

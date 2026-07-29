@@ -192,9 +192,6 @@ def main(args):
     )
 
     do_sample = args.do_sample
-    if args.samples_per_template > 1 and not do_sample:
-        print("[*] samples_per_template > 1 detected; forcing do_sample=True for diversity.")
-        do_sample = True
 
     generation_cfg = {
         "max_new_tokens": args.max_new_tokens,
@@ -265,24 +262,43 @@ def main(args):
                 seq = generated_token_ids[i]
                 indices = topk_indices_all[i]
                 probs = topk_probs_all[i]
+                retained_generated_ids = list(seq)
+
+                if not (
+                    len(retained_generated_ids) == len(indices) == len(probs)
+                ):
+                    raise RuntimeError(
+                        "Generated-token and candidate-position lengths diverged"
+                    )
 
                 q_text = tokenizer.decode(seq, skip_special_tokens=True).strip().strip('"\'')
 
                 while indices and indices[0] and indices[0][0] in quote_ids:
                     indices.pop(0)
                     probs.pop(0)
+                    retained_generated_ids.pop(0)
                 while indices and indices[-1] and indices[-1][0] in eos_ids:
                     indices.pop()
                     probs.pop()
+                    retained_generated_ids.pop()
                 while indices and indices[-1] and indices[-1][0] in quote_ids:
                     indices.pop()
                     probs.pop()
+                    retained_generated_ids.pop()
+
+                if not (
+                    len(retained_generated_ids) == len(indices) == len(probs)
+                ):
+                    raise RuntimeError(
+                        "Generated-token and candidate-position lengths diverged"
+                    )
 
                 record = {
                     "doc_id": item["doc_id"],
                     "query_text": q_text,
                     "indices": indices,
                     "probs": probs,
+                    "generated_token_ids": retained_generated_ids,
                     "prompt_id": item["template"]["id"],
                     "prompt_name": item["template"]["name"],
                     "sample_idx": item["sample_idx"],
@@ -344,8 +360,21 @@ if __name__ == "__main__":
     parser.add_argument("--start_idx", type=int, default=0)
     parser.add_argument("--infer_batch_size", type=int, default=24)
     parser.add_argument("--template_ids", type=str, default="all")
-    parser.add_argument("--samples_per_template", type=int, default=2)
-    parser.add_argument("--do_sample", action="store_true")
+    parser.add_argument("--samples_per_template", type=int, default=1)
+    sampling = parser.add_mutually_exclusive_group()
+    sampling.add_argument(
+        "--do_sample",
+        dest="do_sample",
+        action="store_true",
+        help="Sample from the generation distribution (default).",
+    )
+    sampling.add_argument(
+        "--greedy",
+        dest="do_sample",
+        action="store_false",
+        help="Use deterministic greedy decoding.",
+    )
+    parser.set_defaults(do_sample=True)
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--top_k", type=int, default=50)
